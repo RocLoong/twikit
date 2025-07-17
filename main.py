@@ -45,6 +45,7 @@ def get_proxy_config():
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger("httpx").setLevel(logging.WARNING)  # 屏蔽httpx的INFO日志
 logger = logging.getLogger(__name__)
 
 class BrowserAuthScraper:
@@ -183,54 +184,114 @@ class BrowserAuthScraper:
         # 现在这个方法主要用于向后兼容
         return self.user_info if hasattr(self, 'user_info') and self.user_info else None
     
-    async def scrape_user_tweets(self, username: str, max_tweets: int = 100) -> list:
-        """抓取用户推文"""
+    async def scrape_user_tweets(self, username: str, max_tweets: int = 100, start_date: str = None, end_date: str = None, continue_from_checkpoint: bool = False) -> list:
+        """抓取用户推文，支持时间范围和检查点"""
         if not self.is_logged_in:
             print("❌ 请先登录")
             return []
+
+        # 检查点文件处理
+        checkpoint_dir = "checkpoints"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_file = os.path.join(checkpoint_dir, f"{username}_cursor.txt")
         
+        initial_cursor = None
+        if continue_from_checkpoint and os.path.exists(checkpoint_file):
+            with open(checkpoint_file, 'r') as f:
+                initial_cursor = f.read().strip()
+            print(f"ℹ️ 从检查点加载 cursor: {initial_cursor[:20]}...")
+
         try:
+            s_date = datetime.strptime(start_date, '%Y-%m-%d') if start_date else None
+            e_date = datetime.strptime(end_date, '%Y-%m-%d') if end_date else None
+
             print(f"📋 开始抓取 @{username} 的推文...")
-            
-            # 获取用户信息
-            try:
-                user = await self.client.get_user_by_screen_name(username)
-            except:
-                user = await self.client.get_user_by_id(username)
-            
-            # 获取推文
-            tweets = await self.client.get_user_tweets(user.id, 'Tweets', count=20)
+            if s_date or e_date:
+                print(f"   时间范围: {start_date or '...'} -> {end_date or '...'}")
+
+            user = await self.client.get_user_by_screen_name(username)
+            # 使用 initial_cursor 开始抓取
+            tweets = await self.client.get_user_tweets(user.id, 'Tweets', count=40, cursor=initial_cursor)
             tweets_data = []
             
             count = 0
-            while tweets and count < max_tweets:
+            stop_scraping = False
+            while tweets and count < max_tweets and not stop_scraping:
+                # 在每次循环开始时，保存当前的cursor作为检查点
+                if tweets.next_cursor:
+                    with open(checkpoint_file, 'w') as f:
+                        f.write(tweets.next_cursor)
+
                 for tweet in tweets:
                     if count >= max_tweets:
                         break
+
+                    tweet_time = tweet.created_at
+                    if isinstance(tweet_time, str):
+                        try:
+                            tweet_time = datetime.strptime(tweet_time, '%a %b %d %H:%M:%S %z %Y')
+                        except ValueError:
+                            tweet_time = datetime.fromisoformat(tweet_time.replace('Z', '+00:00'))
                     
-                    tweet_data = {
-                        'id': tweet.id,
-                        'text': tweet.text,
-                        'created_at': tweet.created_at,
-                        'user_name': user.name,
-                        'user_screen_name': user.screen_name,
-                        'retweet_count': getattr(tweet, 'retweet_count', 0),
-                        'favorite_count': getattr(tweet, 'favorite_count', 0),
-                        'url': f"https://twitter.com/{user.screen_name}/status/{tweet.id}"
-                    }
-                    
-                    tweets_data.append(tweet_data)
-                    count += 1
-                
-                # 获取下一页
+                    if s_date and tweet_time.date() < s_date.date():
+                        print(f"ℹ️ 推文 ({tweet.created_at.date()}) 早于开始日期 ({start_date})，停止抓取。")
+                        stop_scraping = True
+                        break
+
+                    if (not s_date or tweet_time.date() >= s_date.date()) and \
+                       (not e_date or tweet_time.date() <= e_date.date()):
+                        
+                        tweet_data = {
+                            'id': tweet.id,
+                            'text': tweet.text,
+                            'created_at': tweet.created_at,
+                            'user_name': user.name,
+                            'user_screen_name': user.screen_name,
+                            'retweet_count': getattr(tweet, 'retweet_count', 0),
+                            'favorite_count': getattr(tweet, 'favorite_count', 0),
+                            'url': f"https://twitter.com/{user.screen_name}/status/{tweet.id}"
+                        }
+                        tweets_data.append(tweet_data)
+                        count += 1
+
+                if stop_scraping:
+                    break
+
                 if count < max_tweets:
-                    try:
-                        await asyncio.sleep(2)  # 安全延迟
-                        tweets = await tweets.next()
-                    except:
+                    retries = 3
+                    for attempt in range(retries):
+                        try:
+                            print(f"    ...已获取 {count} 条有效推文，等待 1.5 秒后继续翻页...")
+                            await asyncio.sleep(1.5)
+                            tweets = await tweets.next()
+                            break
+                        except Exception as page_e:
+                            if "429" in str(page_e) or "rate limit" in str(page_e).lower():
+                                wait_time = 60 * (attempt + 1)
+                                print(f"️️️⚠️ 触发速率限制！第 {attempt + 1}/{retries} 次重试，将暂停 {wait_time} 秒...")
+                                await asyncio.sleep(wait_time)
+                            else:
+                                print(f"❌ 无法获取下一页，错误类型: {type(page_e).__name__}, 详情: {page_e}")
+                                print("⚠️ 可能是已到达推文末尾或遇到非速率限制的API错误。")
+                                tweets = None
+                                break
+                    
+                    if tweets is None:
                         break
             
-            print(f"✅ 抓取完成，共获取 {len(tweets_data)} 条推文")
+            if s_date or e_date:
+                final_message = f"✅ 抓取完成，共获取 {len(tweets_data)} 条在指定时间范围内的推文"
+            else:
+                final_message = f"✅ 抓取完成，共获取 {len(tweets_data)} 条推文"
+                if len(tweets_data) < max_tweets:
+                    final_message += f" (目标 {max_tweets} 条，可能已到达用户推文末尾或触发API限制)"
+            
+            print(final_message)
+            # 任务成功完成后，删除检查点文件
+            if os.path.exists(checkpoint_file):
+                os.remove(checkpoint_file)
+                print("ℹ️ 任务完成，已删除检查点文件。")
+
             return tweets_data
             
         except Exception as e:
@@ -238,34 +299,40 @@ class BrowserAuthScraper:
             return []
     
     def save_tweets(self, tweets_data: list, username: str, format_type: str = 'json'):
-        """保存推文数据"""
+        """保存推文数据到指定文件夹"""
         if not tweets_data:
             print("⚠️ 没有数据可保存")
             return
-        
+
+        # 1. 定义并创建主输出目录和用户子目录
+        output_dir = "downloaded_tweets"
+        user_dir = os.path.join(output_dir, username)
+        os.makedirs(user_dir, exist_ok=True)  # exist_ok=True 避免在文件夹已存在时报错
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
+        base_filename = f"{username}_{timestamp}"
+
         if format_type == 'json':
-            filename = f"{username}_{timestamp}.json"
+            filename = os.path.join(user_dir, f"{base_filename}.json")
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(tweets_data, f, ensure_ascii=False, indent=2, default=str)
             print(f"💾 已保存到: {filename}")
-        
+
         elif format_type == 'txt':
-            filename = f"{username}_{timestamp}.txt"
+            filename = os.path.join(user_dir, f"{base_filename}.txt")
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write(f"@{username} 的推文合集\n")
                 f.write(f"抓取时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"总计: {len(tweets_data)} 条推文\n")
                 f.write("=" * 50 + "\n\n")
-                
+
                 for i, tweet in enumerate(tweets_data, 1):
                     f.write(f"推文 {i}:\n")
                     f.write(f"时间: {tweet['created_at']}\n")
                     f.write(f"内容: {tweet['text']}\n")
                     f.write(f"链接: {tweet['url']}\n")
                     f.write("-" * 30 + "\n\n")
-            
+
             print(f"💾 已保存到: {filename}")
 
 async def interactive_mode():
@@ -273,73 +340,82 @@ async def interactive_mode():
     print("🍪 浏览器授权Twitter抓取工具")
     print("=" * 50)
 
-    # 直接使用 cookies.json 文件
     cookies_file = "cookies.json"
-
     if not os.path.exists(cookies_file):
         print(f"\n❌ 找不到 {cookies_file} 文件")
-        print("📖 请先创建cookies.json文件，运行以下命令查看指南:")
-        print("   python cookie_helper.py guide")
-        print("   python cookie_helper.py sample")
+        print("📖 请先运行: python cookie_helper.py guide")
         return
     
-    # 创建抓取器并登录
     scraper = BrowserAuthScraper(cookies_file)
-    
     print(f"\n🔐 正在登录...")
     if not await scraper.login_with_cookies():
         return
     
-    # 显示用户信息
-    user_info = scraper.user_info
-    # print(f"\n👤 当前用户信息:")
-    # print(f"   用户名: @{user_info['screen_name']}")
-    # print(f"   显示名: {user_info['name']}")
-    # print(f"   粉丝数: {user_info['followers_count']:,}")
-    # print(f"   关注数: {user_info['friends_count']:,}")
-    
-    # 获取抓取参数
     print(f"\n📝 请输入抓取参数:")
     target_user = input("目标用户名: ").strip()
     if not target_user:
         print("❌ 用户名不能为空")
         return
+
+    # 检查是否存在检查点，并询问用户是否继续
+    continue_from_checkpoint = False
+    checkpoint_file = f"checkpoints/{target_user}_cursor.txt"
+    if os.path.exists(checkpoint_file):
+        continue_choice = input(f"发现 @{target_user} 的检查点，是否继续？(y/N): ").strip().lower()
+        if continue_choice == 'y':
+            continue_from_checkpoint = True
     
     try:
-        max_tweets = int(input("最大推文数量 [100]: ").strip() or "100")
+        max_tweets = int(input("最大推文数量 (默认1000): ").strip() or "1000")
     except ValueError:
-        max_tweets = 100
+        max_tweets = 1000
+
+    start_date = input("开始日期 (YYYY-MM-DD, 可选): ").strip()
+    end_date = input("结束日期 (YYYY-MM-DD, 可选): ").strip()
     
-    format_type = input("输出格式 (json/txt) [json]: ").strip() or "json"
+    # 使用数字选择文件格式
+    print("请选择输出格式:")
+    print("  1: TXT")
+    print("  2: JSON (默认)")
+    format_choice = input("输入选项 [2]: ").strip()
+
+    if format_choice == '1':
+        format_type = 'txt'
+    else:
+        format_type = 'json'
     
-    # 开始抓取
     print(f"\n🚀 开始抓取 @{target_user} 的推文...")
-    tweets = await scraper.scrape_user_tweets(target_user, max_tweets)
+    tweets = await scraper.scrape_user_tweets(target_user, max_tweets, start_date, end_date, continue_from_checkpoint)
     
     if tweets:
         scraper.save_tweets(tweets, target_user, format_type)
         print(f"\n✅ 抓取完成！")
     else:
-        print(f"\n⚠️ 没有获取到推文")
+        print(f"\n⚠️ 没有获取到符合条件的推文")
 
 async def command_mode():
     """命令行模式"""
+    # 用法: python main.py <用户名> <推文数量> [开始日期] [结束日期]
+    # 示例: python main.py elonmusk 1000 2023-01-01 2023-12-31
     if len(sys.argv) < 3:
-        print("用法: python browser_auth_scraper.py <用户名> <推文数量>")
-        print("示例: python browser_auth_scraper.py elonmusk 100")
+        print("用法: python main.py <用户名> <推文数量> [开始日期] [结束日期]")
+        print("示例: python main.py elonmusk 1000 2023-01-01 2023-12-31")
         print("注意: 请确保当前目录有 cookies.json 文件")
         return
 
     username = sys.argv[1]
     max_tweets = int(sys.argv[2])
-    cookies_file = "cookies.json"  # 固定使用 cookies.json
+    start_date = sys.argv[3] if len(sys.argv) > 3 else None
+    end_date = sys.argv[4] if len(sys.argv) > 4 else None
+    cookies_file = "cookies.json"
     
     scraper = BrowserAuthScraper(cookies_file)
     
     if await scraper.login_with_cookies():
-        tweets = await scraper.scrape_user_tweets(username, max_tweets)
+        tweets = await scraper.scrape_user_tweets(username, max_tweets, start_date, end_date)
         if tweets:
-            scraper.save_tweets(tweets, username)
+            # 命令行模式默认保存为json
+            scraper.save_tweets(tweets, username, 'json')
 
 async def main():
     try:
